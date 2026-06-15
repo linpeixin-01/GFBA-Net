@@ -42,12 +42,13 @@ class RotSobel(nn.Module):
         self.register_buffer('gy', gy.view(1, 1, 3, 3))
 
         angles = torch.linspace(0, 180, max_dirs + 1)[:-1] * (math.pi / 180)
-        self.angles = nn.Parameter(angles)  # (max_dirs,)
+        self.angles = nn.Parameter(angles)
 
         self.gate = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(channels, max_dirs, 1, bias=True)
         )
+        self.conv = nn.Conv2d(channels,channels,3)
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -69,16 +70,17 @@ class RotSobel(nn.Module):
             magnitudes.append(mag)
         mag = torch.cat(magnitudes, dim=0)
         weight = topk_val.sum(dim=1, keepdim=True).view(B, 1, 1, 1)
-        return mag * weight
+        out = mag * weight
+        return out
+
 
 class Hessian(nn.Module):
-
     def __init__(self, channels):
         super().__init__()
         self.channels = channels
-        dxy = torch.tensor([[ 0, -0.5,  0],
-                            [-0.5,  0, 0.5],
-                            [ 0,  0.5,  0]], dtype=torch.float32)
+        dxy = torch.tensor([[1, 0, -1],
+                            [0, 0, 0],
+                            [-1, 0, 1]], dtype=torch.float32)/4.0
         dxx = torch.tensor([[0,  0, 0],
                             [1, -2, 1],
                             [0,  0, 0]], dtype=torch.float32)
@@ -86,15 +88,17 @@ class Hessian(nn.Module):
         self.register_buffer('dxx', dxx.view(1,1,3,3).repeat(channels,1,1,1))
         self.register_buffer('dyy', dyy.view(1,1,3,3).repeat(channels,1,1,1))
         self.register_buffer('dxy', dxy.view(1,1,3,3).repeat(channels,1,1,1))
+        self.conv = nn.Conv2d(3 * channels, channels, 1)
 
     def forward(self, x):
-        Lxx = F.conv2d(x, self.dxx, padding=1, groups=self.channels)
-        Lyy = F.conv2d(x, self.dyy, padding=1, groups=self.channels)
-        Lxy = F.conv2d(x, self.dxy, padding=1, groups=self.channels)
-        detH = Lxx * Lyy - Lxy * Lxy
-        return torch.abs(detH)
+        Hxx = F.conv2d(x, self.dxx, padding=1, groups=self.channels)
+        Hyy = F.conv2d(x, self.dyy, padding=1, groups=self.channels)
+        Hxy = F.conv2d(x, self.dxy, padding=1, groups=self.channels)
+        out = torch.cat((Hxx, Hyy, Hxy), dim=1)
+        out = self.conv(out)
+        return out
 
-class DOBE(nn.Module):
+class GFE(nn.Module):
 
     def __init__(self, channels, sigma):
         super().__init__()
@@ -120,14 +124,13 @@ class DOBE(nn.Module):
         boundary = torch.sigmoid(boundary)
         return boundary
 
-class DOBE_S(nn.Module):
+class GFE_D(nn.Module):
 
-    def __init__(self, in_channels, channels, sigma=1.5):
+    def __init__(self, channels, sigma=2):
         super().__init__()
         self.channels = channels
         self.sigma_value = sigma
-        self.in_channels = in_channels
-        self.conv1 = nn.Conv2d(in_channels, channels, 1, padding='same')
+        self.conv1 = nn.Conv2d(channels, channels, 1, padding='same')
         self.gaussian = Gaussian(channels, sigma)
         self.RSConv = RotSobel(channels)
         self.HConv = Hessian(channels)
@@ -169,51 +172,126 @@ class DWConv(nn.Module):
         x = self.bn2(x)
         x = self.relu(x)
         return x
-class AFEF(nn.Module):
 
-    def __init__(self, in_channels_Feature, in_channels_edge, out_channels):
+class SpatialFusion(nn.Module):
+    def __init__(self, in_channels_de, in_channels_sk):
         super().__init__()
-        self.edge_conv = nn.Sequential(
-            nn.Conv2d(in_channels_edge, out_channels, 3, 1, 1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+
+        self.up = nn.ConvTranspose2d(in_channels_de, in_channels_de, 2, stride=2)
+        self.de_DW = DWConv(in_channels=in_channels_de,out_channels=in_channels_de,kernel_size=3,padding=1)
+        self.de_conv1 = nn.Conv2d(in_channels_de, in_channels_sk, 1, padding=0)
+        self.sp_77c = nn.Conv2d(4, 1, 1, padding=0)
+        self.sigmoid = nn.Sigmoid()
+        self.out_conv1 = nn.Conv2d(2 * in_channels_sk, in_channels_sk, 1, padding=0)
+
+    def forward(self,decoder ,skip ,channel_weight ):
+        identity_sk = skip
+
+        decoder = self.up(decoder)
+        decoder = self.de_DW(decoder)
+        decoder = self.de_conv1(decoder)
+        decoder_2 = decoder * channel_weight
+        identity_de = decoder_2
+
+        de_mean = torch.mean(decoder_2, dim=1, keepdim=True)
+        de_max = torch.max(decoder_2, dim=1, keepdim=True)[0]
+        sk_mean = torch.mean(skip, dim=1, keepdim=True)
+        sk_max = torch.max(skip, dim=1, keepdim=True)[0]
+
+        Spatial = torch.cat((de_mean,de_max,sk_mean,sk_max), dim=1)
+        Spatial = self.sp_77c(Spatial)
+        Spatial_weight = self.sigmoid(Spatial)
+        sk_sp = identity_sk * Spatial_weight
+        de_sp = identity_de * Spatial_weight
+        output = torch.concat((sk_sp, de_sp), dim=1)
+        output = self.out_conv1(output)
+        return output
+
+class BCSF(nn.Module):
+
+    def __init__(self, in_channels,in_channel_decoder, reduction_ratio=16):
+        super().__init__()
+        self.in_channels = in_channels
+        self.reduced_channels = in_channels // reduction_ratio
+
+        self.dwconv3 = DWConv(
+            in_channels=in_channels,
+            out_channels=in_channels,
+            kernel_size=3,
+            padding=1
         )
-        self.feature_conv = nn.Sequential(
-            nn.Conv2d(in_channels_Feature, out_channels, 3, 1, 1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+
+        self.dwconv5 = DWConv(
+            in_channels=in_channels,
+            out_channels=in_channels,
+            kernel_size=5,
+            padding=2
         )
-        self.SE_Block = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(out_channels, out_channels // 4, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels // 4, out_channels, 1),
-            nn.Sigmoid()
+
+        self.dwconv7 = DWConv(
+            in_channels=in_channels,
+            out_channels=in_channels,
+            kernel_size=7,
+            padding=3
         )
-        self.fusion_conv = nn.Sequential(
-            nn.Conv2d(out_channels * 2, out_channels, 3, 1, 1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-        self.weight_generator = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(out_channels * 2, out_channels // 2, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels // 2, 2, 1),
-            nn.Softmax(dim=1)
-        )
-    def forward(self, feature, edge):
-        xsize = feature.size()[2:]
-        edge = F.interpolate(edge, size=xsize, mode='bilinear', align_corners=True)
-        feature_processed = self.feature_conv(feature)
-        edge_processed = self.edge_conv(edge)
-        attention_weights = self.SE_Block(feature_processed)
-        weighted_edge = edge_processed * attention_weights
-        fused = torch.cat([feature_processed, weighted_edge], dim=1)
-        fused = self.fusion_conv(fused)
-        weight_input = torch.cat([feature_processed, fused], dim=1)
-        weights = self.weight_generator(weight_input)  # [B, 2, 1, 1]
-        output = weights[:, 0:1] * fused + weights[:, 1:2] * feature_processed
+
+        self.gfe3 = GFE_D(in_channels)
+        self.gfe5 = GFE_D(in_channels)
+        self.gfe7 = GFE_D(in_channels)
+
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.linear_avg = nn.Linear(in_channels, self.reduced_channels)
+        self.linear_max = nn.Linear(in_channels, self.reduced_channels)
+        self.linear_min = nn.Linear(in_channels, self.reduced_channels)
+        self.Conv11 = nn.Conv2d(3 * in_channels, in_channels, kernel_size=1)
+
+        self.fusion_linear = nn.Linear(self.reduced_channels, in_channels)
+        self.sigmoid = nn.Sigmoid()
+
+        self.SpFusion = SpatialFusion(in_channel_decoder, in_channels)
+
+    def forward(self, x , decoder):
+        identity = x
+        B, C, _, _ = x.shape
+
+        feat3 = self.dwconv3(x)
+        feat5 = self.dwconv5(x)
+        feat7 = self.dwconv7(x)
+
+        feat3 = self.gfe3(feat3)
+        feat5 = self.gfe5(feat5)
+        feat7 = self.gfe7(feat7)
+
+        pool3_avg = self.avg_pool(feat3).flatten(1)
+        pool5_avg = self.avg_pool(feat5).flatten(1)
+        pool7_avg = self.avg_pool(feat7).flatten(1)
+        pool_avg = pool3_avg + pool5_avg + pool7_avg
+
+        pool3_max = self.max_pool(feat3).flatten(1)
+        pool5_max = self.max_pool(feat5).flatten(1)
+        pool7_max = self.max_pool(feat7).flatten(1)
+        pool_max = pool3_max + pool5_max + pool7_max
+
+        pool3_min = -self.max_pool(-feat3).flatten(1)
+        pool5_min = -self.max_pool(-feat5).flatten(1)
+        pool7_min = -self.max_pool(-feat7).flatten(1)
+        pool_min = pool3_min + pool5_min + pool7_min
+
+        out_avg = self.linear_avg(pool_avg)
+        out_max = self.linear_max(pool_max)
+        out_min = self.linear_min(pool_min)
+
+        fused = out_avg + out_max + out_min
+        feat_all = torch.cat((feat3, feat5, feat7), dim=1)
+        feat_all = self.Conv11(feat_all)
+        channel_weight = self.fusion_linear(fused)
+        channel_weight = self.sigmoid(channel_weight).view(B, C, 1, 1)
+        channel_enhanced = feat_all * channel_weight
+        channel_enhanced = identity + channel_enhanced
+
+        output = self.SpFusion(decoder,channel_enhanced,channel_weight)
         return output
 
 class AM(nn.Module):
@@ -243,7 +321,7 @@ class AM(nn.Module):
 
         return output
 
-class BAG(nn.Module):
+class BBG(nn.Module):
 
     def __init__(self, in_channels):
         super().__init__()
@@ -265,36 +343,27 @@ class BAG(nn.Module):
             nn.Conv2d(3, 1, 1),
             nn.BatchNorm2d(1),
             nn.Sigmoid())
-        self.F_fusion = nn.Conv2d(in_channels * 2, in_channels, 1)
-        self.R_fusion = nn.Conv2d(in_channels * 2, in_channels, 1)
+        self.FR3_fusion = nn.Conv2d(in_channels * 2, in_channels, 1)
+        self.FR5_fusion = nn.Conv2d(in_channels * 2, in_channels, 1)
         self.fusion = nn.Conv2d(in_channels * 2, in_channels, 1)
-        self.gamma_f = nn.Parameter(torch.tensor(1.0))
-        self.gamma_r = nn.Parameter(torch.tensor(0.3))
-        self.bn_f = nn.BatchNorm2d(in_channels)
-        self.bn_r = nn.BatchNorm2d(in_channels)
 
     def forward(self, backbone_feature, prior):
         prior = F.interpolate(prior, size=backbone_feature.size()[2:], mode='bilinear', align_corners=True)
         backbone_feature = self.backbone(backbone_feature)
         bf1, bf2 = torch.chunk(backbone_feature, chunks=2, dim=1)
-
         F_prior3 = self.prior3(prior)
         F_prior5 = self.prior5(prior)
         F_bf1 = bf1 * F_prior3
         F_bf2 = bf2 * F_prior5
-        F_out = torch.cat((F_bf1, F_bf2), dim=1)
-        F_out = self.F_fusion(F_out)
-        F_out = self.bn_f(F_out) * self.gamma_f
-
         R_prior3 = -F_prior3 + 1
         R_prior5 = -F_prior5 + 1
         R_bf1 = bf1 * R_prior3
         R_bf2 = bf2 * R_prior5
-        R_out = torch.cat((R_bf1, R_bf2), dim=1)
-        R_out = self.R_fusion(R_out)
-        R_out = self.bn_r(R_out) * self.gamma_r
-
-        out = torch.cat((F_out, R_out), dim=1)
+        FR_3 = torch.cat((F_bf1, R_bf1), 1)
+        FR3_out = self.FR3_fusion(FR_3)
+        FR_5 = torch.cat((F_bf2, R_bf2), 1)
+        FR5_out = self.FR5_fusion(FR_5)
+        out = torch.cat((FR3_out, FR5_out), dim=1)
         out = self.fusion(out)
         return out
 
@@ -319,24 +388,24 @@ class EncoderBlock(nn.Module):
     def __init__(self, c):
         super().__init__()
         self.basic = BasicConv(c)
-        self.BAG = BAG(c)
+        self.BBG = BBG(c)
         self.conv1 = nn.Conv2d(2*c, c, 1)
         self.am = AM(c)
     def forward(self, x, boundary):
         identity = x
-        out = self.basic(x)
-        out = self.BAG(out, boundary)
+        out = self.BBG(x, boundary)
+        out = self.basic(out)
         out = self.am(out)
         out = torch.cat((out, identity), 1)
         out = self.conv1(out)
         return out
 
 
-class DOBA_Net(nn.Module):
+class GFBA_Net(nn.Module):
     def __init__(self, in_channels=3, n_classes=1, base_channels=8):
         super().__init__()
         self.in_channels = in_channels
-        self.prior = DOBE(3, 1.5)
+        self.Geo = GFE(3, 1.5)
         self.initial_conv = nn.Conv2d(in_channels, base_channels * 2, 3, padding=1)
 
         self.encoder0 = EncoderBlock(base_channels * 2)
@@ -374,31 +443,12 @@ class DOBA_Net(nn.Module):
             nn.ReLU(),
         )
 
-        self.dobe1 = DOBE_S(base_channels * 4, base_channels * 2)
-        self.dobe2 = DOBE_S(base_channels * 8, base_channels * 4)
-        self.dobe3 = DOBE_S(base_channels * 16, base_channels * 8)
-        self.dobe4 = DOBE_S(base_channels * 32, base_channels * 16)
-
-        self.afef1 = AFEF(base_channels * 2, base_channels * 2, base_channels * 2)
-        self.afef2 = AFEF(base_channels * 4, base_channels * 4, base_channels * 4)
-        self.afef3 = AFEF(base_channels * 8, base_channels * 8, base_channels * 8)
-        self.afef4 = AFEF(base_channels * 16, base_channels * 16, base_channels * 16)
-
-        self.bn1 = nn.BatchNorm2d(base_channels * 2)
-        self.bn2 = nn.BatchNorm2d(base_channels * 4)
-        self.bn3 = nn.BatchNorm2d(base_channels * 8)
-        self.bn4 = nn.BatchNorm2d(base_channels * 16)
-        self.relu1 = nn.ReLU(inplace=True)
-        self.relu2 = nn.ReLU(inplace=True)
-        self.relu3 = nn.ReLU(inplace=True)
-        self.relu4 = nn.ReLU(inplace=True)
+        self.bcsf1 = BCSF(base_channels * 2, base_channels * 4)
+        self.bcsf2 = BCSF(base_channels * 4, base_channels * 8)
+        self.bcsf3 = BCSF(base_channels * 8, base_channels * 16)
+        self.bcsf4 = BCSF(base_channels * 16,base_channels * 32)
 
         self.pool = torch.nn.MaxPool2d(2)
-        self.conv_1 = nn.Conv2d(base_channels * 4, base_channels * 2, 1, padding='same')
-        self.conv_2 = nn.Conv2d(base_channels * 8, base_channels * 4, 1, padding='same')
-        self.conv_3 = nn.Conv2d(base_channels * 16, base_channels * 8, 1, padding='same')
-        self.conv_4 = nn.Conv2d(base_channels * 32, base_channels * 16, 1, padding='same')
-        self.up4 = nn.ConvTranspose2d(base_channels * 32, base_channels * 16, 2, stride=2)
         self.dec4 = nn.Sequential(
             DWConv(base_channels * 16, base_channels * 16),
             nn.BatchNorm2d(base_channels * 16),
@@ -408,7 +458,6 @@ class DOBA_Net(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        self.up3 = nn.ConvTranspose2d(base_channels * 16, base_channels * 8, 2, stride=2)
         self.dec3 = nn.Sequential(
             DWConv(base_channels * 8, base_channels * 8),
             nn.BatchNorm2d(base_channels * 8),
@@ -418,7 +467,6 @@ class DOBA_Net(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        self.up2 = nn.ConvTranspose2d(base_channels * 8, base_channels * 4, 2, stride=2)
         self.dec2 = nn.Sequential(
             DWConv(base_channels * 4, base_channels * 4),
             nn.BatchNorm2d(base_channels * 4),
@@ -428,7 +476,6 @@ class DOBA_Net(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        self.up1 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2, 2, stride=2)
         self.dec1 = nn.Sequential(
             DWConv(base_channels * 2, base_channels * 2),
             nn.BatchNorm2d(base_channels * 2),
@@ -443,47 +490,30 @@ class DOBA_Net(nn.Module):
 
     def forward(self, x):
 
-        prior = self.prior(x)
+        geo_feature = self.Geo(x)
         x = self.initial_conv(x)
 
-        e1 = self.encoder0(x, prior)
+        e1 = self.encoder0(x, geo_feature)
         e1_down = self.down0(e1)
-        e2 = self.encoder1(e1_down, prior)
+        e2 = self.encoder1(e1_down, geo_feature)
         e2_down = self.down1(e2)
-        e3 = self.encoder2(e2_down, prior)
+        e3 = self.encoder2(e2_down, geo_feature)
         e3_down = self.down2(e3)
-        e4 = self.encoder3(e3_down, prior)
+        e4 = self.encoder3(e3_down, geo_feature)
         e4_down = self.down3(e4)
 
         bottleneck = self.bottleneck(e4_down)
 
-        edge4 = self.dobe4(bottleneck)
-        e4_skip = self.afef4(e4,edge4)
-        edge3 = self.dobe3(e4_skip)
-        e3_skip = self.afef3(e3,edge3)
-        edge2 = self.dobe2(e3_skip)
-        e2_skip = self.afef2(e2,edge2)
-        edge1 = self.dobe1(e2_skip)
-        e1_skip = self.afef1(e1,edge1)
-
-        d4 = self.up4(bottleneck)
-        d4 = torch.cat([d4, e4_skip], dim=1)
-        d4 = self.relu4(self.bn4(self.conv_4(d4)))
+        d4 = self.bcsf4(e4,bottleneck)
         d4 = self.dec4(d4)
 
-        d3 = self.up3(d4)
-        d3 = torch.cat([d3, e3_skip], dim=1)
-        d3 = self.relu3(self.bn3(self.conv_3(d3)))
+        d3 = self.bcsf3(e3,d4)
         d3 = self.dec3(d3)
 
-        d2 = self.up2(d3)
-        d2 = torch.cat([d2, e2_skip], dim=1)
-        d2 = self.relu2(self.bn2(self.conv_2(d2)))
+        d2 = self.bcsf2(e2,d3)
         d2 = self.dec2(d2)
 
-        d1 = self.up1(d2)
-        d1 = torch.cat([d1, e1_skip], dim=1)
-        d1 = self.relu1(self.bn1(self.conv_1(d1)))
+        d1 = self.bcsf1(e1,d2)
         d1 = self.dec1(d1)
 
         output = self.final_conv(d1)
