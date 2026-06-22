@@ -15,3 +15,4 @@ Tested on 5 medical image segmentation datasets:
 
 5、PH2 (Dermoscopy)
 
+## Setup
