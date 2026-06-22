@@ -53,12 +53,12 @@ python test.py
 
 ## Parameters
 
-1.epoch:2000
-1.Batch size: 16
-1.img_size：224
-1.Learning rate: 1e-3
-1.Early stopping patience: 100
-1.Weight decay: 1e-5
+1. epoch:2000
+1. Batch size: 16
+1. img_size：224
+1. Learning rate: 1e-3
+1. Early stopping patience: 100
+1. Weight decay: 1e-5
 
 ## Citation
 If you find our repository useful for your research, please consider citing our paper. This paper has been submitted to the journal 'Visual Computer' for editorial review.
