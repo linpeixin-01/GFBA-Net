@@ -5,13 +5,50 @@ Accurate medical image segmentation serves as a crucial foundation for computer-
 ## Datasets
 Tested on 5 medical image segmentation datasets:
 
-1、ISIC2017 (Skin Lesion)
-2、FIVES (Eye Vessels)
-3、BUSI (Breast Ultrasound)
-4、COVID-19 (Lung CT)
-5、PH2 (Dermoscopy)
+1. ISIC2017 (Skin Lesion)
+1. FIVES (Eye Vessels)
+1. BUSI (Breast Ultrasound)
+1. COVID-19 (Lung CT)
+1. PH2 (Dermoscopy)
 
 ## Setup
 ```java
 conda create -n GFBANet python=3.8
+conda activate GFBANet
+conda install pytorch==1.13.1 torchvision==0.14.1 torchaudio==0.13.1 pytorch-cuda=11.7 -c pytorch -c nvidia
+pip install numpy opencv-python pillow scikit-learn matplotlib
+pip install thop tqdm tensorboard joblib
 ```
+
+## Dataset Structure
+```java
+data/
+├── FIVES/
+│   ├── train/
+│   │   ├── images/
+│   │   └── masks/
+│   ├── val/
+│   │   ├── images/
+│   │   └── masks/
+│   └── test/
+│       ├── images/
+│       └── masks/
+└── ... (other datasets)
+```
+
+## Usage
+1. train：
+```java
+conda activates GFBANet
+cd ./project
+python train.py
+```
+1. test：
+```java
+python test.py
+```
+
+
+
+
+
