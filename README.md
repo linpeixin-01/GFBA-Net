@@ -42,11 +42,11 @@ data/
 conda activates GFBANet
 cd ./project
 ```
-1. train：
+2. Train：
 ```
 python train.py
 ```
-1. test：
+3. Test：
 ```
 python test.py
 ```
