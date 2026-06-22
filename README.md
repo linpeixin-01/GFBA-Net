@@ -36,10 +36,13 @@ data/
 ```
 
 ## Usage
-1. train：
+1. Activate Environment
 ```java
 conda activates GFBANet
 cd ./project
+```
+1. train：
+```java
 python train.py
 ```
 1. test：
@@ -47,7 +50,10 @@ python train.py
 python test.py
 ```
 
-
-
-
+## Parameters
+epoch:2000
+Learning rate: 1e-3
+Batch size: 16
+Early stopping patience: 100
+Weight decay: 1e-5
 
