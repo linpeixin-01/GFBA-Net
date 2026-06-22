@@ -4,5 +4,14 @@ Accurate medical image segmentation serves as a crucial foundation for computer-
 
 ## Datasets
 Tested on 5 medical image segmentation datasets:
--ISIC2017 (Skin Lesion)
+
+1、ISIC2017 (Skin Lesion)
+
+2、FIVES (Eye Vessels)
+
+3、BUSI (Breast Ultrasound)
+
+4、COVID-19 (Lung CT)
+
+5、PH2 (Dermoscopy)
 
