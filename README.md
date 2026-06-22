@@ -4,5 +4,5 @@ Accurate medical image segmentation serves as a crucial foundation for computer-
 
 ## Datasets
 Tested on 5 medical image segmentation datasets:
-U+25CF ISIC2017 (Skin Lesion)
+-ISIC2017 (Skin Lesion)
 
