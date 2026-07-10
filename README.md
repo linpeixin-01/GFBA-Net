@@ -60,3 +60,12 @@ python test.py
 1. Early stopping patience: 100
 1. Weight decay: 1e-5
 
+## Citation
+If you find our repository useful for your research, please consider citing our paper. This paper has been submitted to the journal 'Visual Computer' for editorial review.
+```
+@article{lin2026gfba,
+  author = {Lin, Peixin and Li, YiWei and Li, Shiren and Syed, Faisal, Bukhari3 and Shukurov, Kamoliddin and Serestina, Viriri and Jo˜ao, Paulo, Papa and Yang, Guangguang},
+  title = {GFBA-Net: A Geometric Feature-driven Boundary-aware Network for Medical Image Segmentation},
+  year = {2026},
+}
+```
